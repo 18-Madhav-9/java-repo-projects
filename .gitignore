@@ -1,0 +1,31 @@
+# ── Build output ──
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# ── IDE ──
+.idea/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.project
+.classpath
+.settings/
+*.swp
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Runtime ──
+data/
+*.log
+logs/
+
+# ── Spring ──
+application-local.yml
+
+run.sh
