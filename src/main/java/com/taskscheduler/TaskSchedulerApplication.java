@@ -2,20 +2,19 @@ package com.taskscheduler;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
- * Task Scheduler Application — Entry Point
+ * Task Scheduler Application — Entry Point (V2)
  *
- * A production-grade, database-driven job scheduling system.
- * Jobs are stored in the database and executed dynamically based on type.
- * Business logic is fully decoupled from the scheduling engine.
+ * A production-grade, distributed job scheduling system powered by Quartz.
+ * Jobs are managed via Quartz JDBC JobStore (cluster-safe) and executed
+ * by Spring-managed beans with retry support.
  *
- * Architecture:
- *   REST API → Job Management → Scheduler Engine → Dispatcher → Business Services → DB
+ * V2 changes:
+ *   - Removed @EnableScheduling (Quartz replaces Spring scheduler)
+ *   - @EnableRetry is configured in RetryConfig.java
  */
 @SpringBootApplication
-@EnableScheduling
 public class TaskSchedulerApplication {
 
     public static void main(String[] args) {

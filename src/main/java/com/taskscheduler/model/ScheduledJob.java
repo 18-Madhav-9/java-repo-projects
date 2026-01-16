@@ -8,12 +8,8 @@ import java.time.LocalDateTime;
 /**
  * Represents a schedulable job persisted in the database.
  *
- * The scheduler engine reads active jobs from this table on every tick
- * and dispatches them to the appropriate executor. Admins can enable/disable
- * jobs at runtime without requiring a restart.
- *
- * The {@code cronExpression} field is a V2 placeholder — currently unused
- * but reserved for Quartz-based cron scheduling.
+ * V2: Added jobGroup and description fields for Quartz integration.
+ * The cronExpression field is now actively used by Quartz CronTrigger.
  */
 @Entity
 @Table(name = "scheduled_jobs")
@@ -32,10 +28,17 @@ public class ScheduledJob {
     private String name;
 
     @Column(nullable = false)
-    private String type;  // EMAIL, REPORT, SYNC
+    private String type;  // EMAIL, PDF_REPORT, KAFKA_PUBLISH
+
+    @Column(name = "job_group", nullable = false)
+    @Builder.Default
+    private String jobGroup = "DEFAULT";
+
+    @Column(length = 500)
+    private String description;
 
     @Column(name = "cron_expression")
-    private String cronExpression;  // V2 placeholder for Quartz integration
+    private String cronExpression;
 
     @Column(nullable = false)
     private boolean active;

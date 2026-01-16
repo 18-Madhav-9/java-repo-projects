@@ -5,14 +5,16 @@ spring:
   application:
     name: task-scheduler
 
+  # ── PostgreSQL DataSource ──────────────────────────────────────────
   datasource:
-    url: jdbc:h2:file:./data/scheduler-db
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
+    url: jdbc:postgresql://localhost:15432/scheduler_db
+    username: scheduler
+    password: scheduler123
+    driver-class-name: org.postgresql.Driver
 
+  # ── JPA / Hibernate ───────────────────────────────────────────────
   jpa:
-    database-platform: org.hibernate.dialect.H2Dialect
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
     hibernate:
       ddl-auto: update
     show-sql: false
@@ -20,18 +22,38 @@ spring:
       hibernate:
         format_sql: true
 
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
+  # ── Quartz Scheduler ──────────────────────────────────────────────
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: always
+    properties:
+      org.quartz.scheduler.instanceName: TaskSchedulerCluster
+      org.quartz.scheduler.instanceId: AUTO
+      org.quartz.jobStore.driverDelegateClass: org.quartz.impl.jdbcjobstore.PostgreSQLDelegate
+      org.quartz.jobStore.tablePrefix: QRTZ_
+      org.quartz.jobStore.isClustered: true
+      org.quartz.jobStore.clusterCheckinInterval: 15000
+      org.quartz.jobStore.useProperties: true
+      org.quartz.threadPool.class: org.quartz.simpl.SimpleThreadPool
+      org.quartz.threadPool.threadCount: 5
+      org.quartz.threadPool.threadPriority: 5
 
-# ── Scheduler Configuration ──────────────────────────────────────────
-scheduler:
-  polling-interval-ms: 60000   # 1 minute between scheduler ticks
-  thread-pool-size: 4          # reserved for V2 parallel execution
+  # ── Kafka (disabled for mock — enable when broker is available) ──
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
 
+# ── PDF Report Output ────────────────────────────────────────────────
+report:
+  output-dir: /tmp/reports
+
+# ── Logging ──────────────────────────────────────────────────────────
 logging:
   level:
     root: INFO
     com.taskscheduler: DEBUG
+    org.quartz: INFO
     org.hibernate.SQL: WARN

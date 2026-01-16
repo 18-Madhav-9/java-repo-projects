@@ -28,4 +28,9 @@ logs/
 # ── Spring ──
 application-local.yml
 
+# ── Scripts ──
 run.sh
+
+# ── Frontend ──
+frontend/node_modules/
+frontend/dist/

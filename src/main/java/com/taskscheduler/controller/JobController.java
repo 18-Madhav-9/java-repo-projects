@@ -1,200 +1,363 @@
 package com.taskscheduler.controller;
 
-import com.taskscheduler.model.ScheduledJob;
-import com.taskscheduler.repository.ScheduledJobRepository;
-import com.taskscheduler.util.CronUtils;
+import com.taskscheduler.job.impl.EmailJob;
+import com.taskscheduler.job.impl.KafkaPublishJob;
+import com.taskscheduler.job.impl.PdfReportJob;
+import com.taskscheduler.model.JobExecutionLog;
+import com.taskscheduler.repository.JobExecutionLogRepository;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
+import org.quartz.*;
+import org.quartz.impl.matchers.GroupMatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.*;
 
 /**
- * REST API for job management.
+ * Unified REST API for Quartz job management and execution monitoring.
  *
- * Provides CRUD operations for scheduled jobs, allowing admins to
- * create, list, enable/disable, and delete jobs at runtime without
- * requiring an application restart.
+ * All scheduling operations go through the Quartz Scheduler API —
+ * NO custom DB polling or loop logic. This controller is the single
+ * entry point for the React admin dashboard.
  */
 @RestController
-@RequestMapping("/jobs")
+@RequestMapping("/api/jobs")
 public class JobController {
 
     private static final Logger log = LoggerFactory.getLogger(JobController.class);
 
-    private final ScheduledJobRepository jobRepository;
+    private final Scheduler scheduler;
+    private final JobExecutionLogRepository logRepository;
 
-    public JobController(ScheduledJobRepository jobRepository) {
-        this.jobRepository = jobRepository;
+    public JobController(Scheduler scheduler, JobExecutionLogRepository logRepository) {
+        this.scheduler = scheduler;
+        this.logRepository = logRepository;
     }
 
-    // ── CREATE ──────────────────────────────────────────────────────
+    // ── LIST JOBS ───────────────────────────────────────────────────
 
     /**
-     * Create a new scheduled job.
+     * List all scheduled Quartz jobs with metadata.
      *
-     * POST /jobs
-     * Body: { "name": "...", "type": "EMAIL|REPORT|SYNC", "cronExpression": "...", "active": true }
+     * GET /api/jobs
      */
-    @PostMapping
-    public ResponseEntity<Map<String, Object>> createJob(@Valid @RequestBody CreateJobRequest request) {
-        log.info("Creating job: name={}, type={}", request.name(), request.type());
+    @GetMapping
+    public ResponseEntity<List<Map<String, Object>>> listJobs() throws SchedulerException {
+        List<Map<String, Object>> jobs = new ArrayList<>();
 
-        // Validate job type
-        String type = request.type().toUpperCase().trim();
-        if (!isValidType(type)) {
-            return errorResponse(HttpStatus.BAD_REQUEST,
-                    "Invalid job type: " + type + ". Supported: EMAIL, REPORT, SYNC");
-        }
+        for (String groupName : scheduler.getJobGroupNames()) {
+            for (JobKey jobKey : scheduler.getJobKeys(GroupMatcher.jobGroupEquals(groupName))) {
+                JobDetail jobDetail = scheduler.getJobDetail(jobKey);
+                List<? extends Trigger> triggers = scheduler.getTriggersOfJob(jobKey);
 
-        // Check for duplicate name
-        if (jobRepository.findByName(request.name()).isPresent()) {
-            return errorResponse(HttpStatus.CONFLICT,
-                    "Job with name '" + request.name() + "' already exists");
-        }
+                Map<String, Object> jobInfo = new LinkedHashMap<>();
+                jobInfo.put("name", jobKey.getName());
+                jobInfo.put("group", jobKey.getGroup());
+                jobInfo.put("description", jobDetail.getDescription());
+                jobInfo.put("jobClass", jobDetail.getJobClass().getSimpleName());
 
-        // Validate cron expression if provided
-        if (request.cronExpression() != null && !request.cronExpression().isBlank()) {
-            if (!CronUtils.isValid(request.cronExpression())) {
-                return errorResponse(HttpStatus.BAD_REQUEST,
-                        "Invalid cron expression: " + request.cronExpression());
+                if (!triggers.isEmpty()) {
+                    Trigger trigger = triggers.get(0);
+                    jobInfo.put("state", scheduler.getTriggerState(trigger.getKey()).name());
+                    jobInfo.put("nextFireTime", toLocalDateTime(trigger.getNextFireTime()));
+                    jobInfo.put("previousFireTime", toLocalDateTime(trigger.getPreviousFireTime()));
+
+                    if (trigger instanceof CronTrigger cronTrigger) {
+                        jobInfo.put("cronExpression", cronTrigger.getCronExpression());
+                    }
+                } else {
+                    jobInfo.put("state", "NONE");
+                    jobInfo.put("nextFireTime", null);
+                    jobInfo.put("previousFireTime", null);
+                }
+
+                jobs.add(jobInfo);
             }
         }
 
-        ScheduledJob job = ScheduledJob.builder()
-                .name(request.name())
-                .type(type)
-                .cronExpression(request.cronExpression())
-                .active(request.active() != null ? request.active() : true)
-                .build();
-
-        ScheduledJob saved = jobRepository.save(job);
-        log.info("Job created: id={}, name={}", saved.getId(), saved.getName());
-
-        return ResponseEntity.status(HttpStatus.CREATED).body(jobToMap(saved));
+        return ResponseEntity.ok(jobs);
     }
 
-    // ── READ ────────────────────────────────────────────────────────
+    // ── CREATE JOB ──────────────────────────────────────────────────
 
     /**
-     * List all scheduled jobs.
+     * Schedule a new Quartz job.
      *
-     * GET /jobs
-     * Optional query param: ?type=EMAIL
+     * POST /api/jobs
      */
-    @GetMapping
-    public ResponseEntity<List<Map<String, Object>>> listJobs(
-            @RequestParam(required = false) String type) {
+    @PostMapping
+    public ResponseEntity<Map<String, Object>> createJob(@Valid @RequestBody CreateJobRequest request) {
+        try {
+            Class<? extends Job> jobClass = resolveJobClass(request.type());
+            if (jobClass == null) {
+                return errorResponse(HttpStatus.BAD_REQUEST,
+                        "Unknown job type: " + request.type() + ". Supported: EMAIL, PDF_REPORT, KAFKA_PUBLISH");
+            }
 
-        List<ScheduledJob> jobs;
-        if (type != null && !type.isBlank()) {
-            jobs = jobRepository.findByType(type.toUpperCase().trim());
-        } else {
-            jobs = jobRepository.findAll();
+            String group = request.group() != null ? request.group() : "DEFAULT";
+            JobKey jobKey = JobKey.jobKey(request.name(), group);
+
+            // Check if job already exists
+            if (scheduler.checkExists(jobKey)) {
+                return errorResponse(HttpStatus.CONFLICT,
+                        "Job '" + request.name() + "' already exists in group '" + group + "'");
+            }
+
+            // Build job detail
+            JobDetail jobDetail = JobBuilder.newJob(jobClass)
+                    .withIdentity(jobKey)
+                    .withDescription(request.description())
+                    .storeDurably(true)
+                    .build();
+
+            // Build trigger
+            String cron = request.cronExpression() != null ? request.cronExpression() : "0 0/5 * * * ?";
+            CronTrigger trigger = TriggerBuilder.newTrigger()
+                    .withIdentity(request.name() + "-trigger", group)
+                    .withSchedule(CronScheduleBuilder.cronSchedule(cron)
+                            .withMisfireHandlingInstructionFireAndProceed())
+                    .build();
+
+            scheduler.scheduleJob(jobDetail, trigger);
+            log.info("Job scheduled: {} [{}] cron={}", request.name(), request.type(), cron);
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("message", "Job scheduled successfully");
+            response.put("name", request.name());
+            response.put("group", group);
+            response.put("type", request.type());
+            response.put("cronExpression", cron);
+
+            return ResponseEntity.status(HttpStatus.CREATED).body(response);
+
+        } catch (SchedulerException e) {
+            log.error("Failed to schedule job: {}", e.getMessage(), e);
+            return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to schedule job: " + e.getMessage());
         }
+    }
 
-        List<Map<String, Object>> result = jobs.stream()
-                .map(this::jobToMap)
-                .toList();
+    // ── TRIGGER NOW ─────────────────────────────────────────────────
 
-        return ResponseEntity.ok(result);
+    /**
+     * Trigger a job to run immediately.
+     *
+     * POST /api/jobs/{group}/{name}/trigger
+     */
+    @PostMapping("/{group}/{name}/trigger")
+    public ResponseEntity<Map<String, Object>> triggerJob(
+            @PathVariable String group, @PathVariable String name) {
+        try {
+            JobKey jobKey = JobKey.jobKey(name, group);
+
+            if (!scheduler.checkExists(jobKey)) {
+                return ResponseEntity.notFound().build();
+            }
+
+            scheduler.triggerJob(jobKey);
+            log.info("Job triggered manually: {}.{}", group, name);
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("message", "Job triggered successfully");
+            response.put("name", name);
+            response.put("group", group);
+            return ResponseEntity.ok(response);
+
+        } catch (SchedulerException e) {
+            return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to trigger job: " + e.getMessage());
+        }
+    }
+
+    // ── PAUSE ───────────────────────────────────────────────────────
+
+    /**
+     * Pause a scheduled job.
+     *
+     * POST /api/jobs/{group}/{name}/pause
+     */
+    @PostMapping("/{group}/{name}/pause")
+    public ResponseEntity<Map<String, Object>> pauseJob(
+            @PathVariable String group, @PathVariable String name) {
+        try {
+            JobKey jobKey = JobKey.jobKey(name, group);
+
+            if (!scheduler.checkExists(jobKey)) {
+                return ResponseEntity.notFound().build();
+            }
+
+            scheduler.pauseJob(jobKey);
+            log.info("Job paused: {}.{}", group, name);
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("message", "Job paused successfully");
+            response.put("name", name);
+            response.put("group", group);
+            response.put("state", "PAUSED");
+            return ResponseEntity.ok(response);
+
+        } catch (SchedulerException e) {
+            return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to pause job: " + e.getMessage());
+        }
+    }
+
+    // ── RESUME ──────────────────────────────────────────────────────
+
+    /**
+     * Resume a paused job.
+     *
+     * POST /api/jobs/{group}/{name}/resume
+     */
+    @PostMapping("/{group}/{name}/resume")
+    public ResponseEntity<Map<String, Object>> resumeJob(
+            @PathVariable String group, @PathVariable String name) {
+        try {
+            JobKey jobKey = JobKey.jobKey(name, group);
+
+            if (!scheduler.checkExists(jobKey)) {
+                return ResponseEntity.notFound().build();
+            }
+
+            scheduler.resumeJob(jobKey);
+            log.info("Job resumed: {}.{}", group, name);
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("message", "Job resumed successfully");
+            response.put("name", name);
+            response.put("group", group);
+            response.put("state", "NORMAL");
+            return ResponseEntity.ok(response);
+
+        } catch (SchedulerException e) {
+            return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to resume job: " + e.getMessage());
+        }
+    }
+
+    // ── DELETE ──────────────────────────────────────────────────────
+
+    /**
+     * Delete a scheduled job permanently.
+     *
+     * DELETE /api/jobs/{group}/{name}
+     */
+    @DeleteMapping("/{group}/{name}")
+    public ResponseEntity<Map<String, Object>> deleteJob(
+            @PathVariable String group, @PathVariable String name) {
+        try {
+            JobKey jobKey = JobKey.jobKey(name, group);
+
+            if (!scheduler.checkExists(jobKey)) {
+                return ResponseEntity.notFound().build();
+            }
+
+            scheduler.deleteJob(jobKey);
+            log.info("Job deleted: {}.{}", group, name);
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("message", "Job deleted successfully");
+            response.put("name", name);
+            response.put("group", group);
+            return ResponseEntity.ok(response);
+
+        } catch (SchedulerException e) {
+            return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to delete job: " + e.getMessage());
+        }
+    }
+
+    // ── EXECUTION LOGS ──────────────────────────────────────────────
+
+    /**
+     * Get paginated execution logs.
+     *
+     * GET /api/jobs/logs?page=0&size=20
+     */
+    @GetMapping("/logs")
+    public ResponseEntity<Map<String, Object>> getExecutionLogs(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+
+        Page<JobExecutionLog> logPage = logRepository
+                .findAllByOrderByStartTimeDesc(PageRequest.of(page, size));
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("logs", logPage.getContent().stream()
+                .map(this::logToMap)
+                .toList());
+        response.put("currentPage", logPage.getNumber());
+        response.put("totalPages", logPage.getTotalPages());
+        response.put("totalElements", logPage.getTotalElements());
+        response.put("pageSize", logPage.getSize());
+
+        return ResponseEntity.ok(response);
     }
 
     /**
-     * Get a single job by ID.
+     * Get execution summary statistics.
      *
-     * GET /jobs/{id}
+     * GET /api/jobs/logs/summary
      */
-    @GetMapping("/{id}")
-    public ResponseEntity<Map<String, Object>> getJob(@PathVariable Long id) {
-        return jobRepository.findById(id)
-                .map(job -> ResponseEntity.ok(jobToMap(job)))
-                .orElse(ResponseEntity.notFound().build());
-    }
+    @GetMapping("/logs/summary")
+    public ResponseEntity<Map<String, Object>> getExecutionSummary() {
+        List<JobExecutionLog> allLogs = logRepository.findAll();
 
-    // ── ENABLE / DISABLE ────────────────────────────────────────────
+        long total = allLogs.size();
+        long success = allLogs.stream().filter(l -> "SUCCESS".equals(l.getStatus())).count();
+        long failed = allLogs.stream().filter(l -> "FAILED".equals(l.getStatus())).count();
+        double avgDurationMs = allLogs.stream()
+                .filter(l -> l.getExecutionDurationMs() != null)
+                .mapToLong(JobExecutionLog::getExecutionDurationMs)
+                .average()
+                .orElse(0.0);
 
-    /**
-     * Enable a job.
-     *
-     * PUT /jobs/{id}/enable
-     */
-    @PutMapping("/{id}/enable")
-    public ResponseEntity<Map<String, Object>> enableJob(@PathVariable Long id) {
-        return toggleJob(id, true);
-    }
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("totalExecutions", total);
+        summary.put("successCount", success);
+        summary.put("failedCount", failed);
+        summary.put("successRate", total > 0 ? String.format("%.1f%%", (success * 100.0) / total) : "N/A");
+        summary.put("averageDurationMs", String.format("%.0f", avgDurationMs));
 
-    /**
-     * Disable a job.
-     *
-     * PUT /jobs/{id}/disable
-     */
-    @PutMapping("/{id}/disable")
-    public ResponseEntity<Map<String, Object>> disableJob(@PathVariable Long id) {
-        return toggleJob(id, false);
-    }
-
-    // ── DELETE ───────────────────────────────────────────────────────
-
-    /**
-     * Delete a job permanently.
-     *
-     * DELETE /jobs/{id}
-     */
-    @DeleteMapping("/{id}")
-    public ResponseEntity<Map<String, Object>> deleteJob(@PathVariable Long id) {
-        return jobRepository.findById(id)
-                .map(job -> {
-                    jobRepository.delete(job);
-                    log.info("Job deleted: id={}, name={}", id, job.getName());
-
-                    Map<String, Object> response = new LinkedHashMap<>();
-                    response.put("message", "Job deleted successfully");
-                    response.put("deletedJob", jobToMap(job));
-                    return ResponseEntity.ok(response);
-                })
-                .orElse(ResponseEntity.notFound().build());
+        return ResponseEntity.ok(summary);
     }
 
     // ── HELPERS ─────────────────────────────────────────────────────
 
-    private ResponseEntity<Map<String, Object>> toggleJob(Long id, boolean active) {
-        return jobRepository.findById(id)
-                .map(job -> {
-                    job.setActive(active);
-                    ScheduledJob saved = jobRepository.save(job);
-                    String action = active ? "enabled" : "disabled";
-                    log.info("Job {}: id={}, name={}", action, id, job.getName());
-
-                    Map<String, Object> response = new LinkedHashMap<>();
-                    response.put("message", "Job " + action + " successfully");
-                    response.put("job", jobToMap(saved));
-                    return ResponseEntity.ok(response);
-                })
-                .orElse(ResponseEntity.notFound().build());
+    private Class<? extends Job> resolveJobClass(String type) {
+        return switch (type.toUpperCase().trim()) {
+            case "EMAIL"         -> EmailJob.class;
+            case "PDF_REPORT"    -> PdfReportJob.class;
+            case "KAFKA_PUBLISH" -> KafkaPublishJob.class;
+            default              -> null;
+        };
     }
 
-    private Map<String, Object> jobToMap(ScheduledJob job) {
+    private LocalDateTime toLocalDateTime(Date date) {
+        if (date == null) return null;
+        return date.toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime();
+    }
+
+    private Map<String, Object> logToMap(JobExecutionLog executionLog) {
         Map<String, Object> map = new LinkedHashMap<>();
-        map.put("id", job.getId());
-        map.put("name", job.getName());
-        map.put("type", job.getType());
-        map.put("cronExpression", job.getCronExpression());
-        map.put("cronDescription", CronUtils.describe(job.getCronExpression()));
-        map.put("active", job.isActive());
-        map.put("createdAt", job.getCreatedAt());
-        map.put("updatedAt", job.getUpdatedAt());
+        map.put("id", executionLog.getId());
+        map.put("jobName", executionLog.getJobName());
+        map.put("jobGroup", executionLog.getJobGroup());
+        map.put("status", executionLog.getStatus());
+        map.put("startTime", executionLog.getStartTime());
+        map.put("endTime", executionLog.getEndTime());
+        map.put("executionDurationMs", executionLog.getExecutionDurationMs());
+        map.put("retryCount", executionLog.getRetryCount());
+        map.put("errorMessage", executionLog.getErrorMessage());
         return map;
-    }
-
-    private boolean isValidType(String type) {
-        return "EMAIL".equals(type) || "REPORT".equals(type) || "SYNC".equals(type);
     }
 
     private ResponseEntity<Map<String, Object>> errorResponse(HttpStatus status, String message) {
@@ -209,9 +372,10 @@ public class JobController {
     public record CreateJobRequest(
             @NotBlank(message = "Job name is required")
             String name,
-            @NotBlank(message = "Job type is required")
+            @NotBlank(message = "Job type is required (EMAIL, PDF_REPORT, KAFKA_PUBLISH)")
             String type,
-            String cronExpression,
-            Boolean active
+            String group,
+            String description,
+            String cronExpression
     ) {}
 }
