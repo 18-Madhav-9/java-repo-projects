@@ -1,0 +1,59 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: task-scheduler
+
+  # ── PostgreSQL DataSource ──────────────────────────────────────────
+  datasource:
+    url: jdbc:postgresql://localhost:15432/scheduler_db
+    username: scheduler
+    password: scheduler123
+    driver-class-name: org.postgresql.Driver
+
+  # ── JPA / Hibernate ───────────────────────────────────────────────
+  jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  # ── Quartz Scheduler ──────────────────────────────────────────────
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: always
+    properties:
+      org.quartz.scheduler.instanceName: TaskSchedulerCluster
+      org.quartz.scheduler.instanceId: AUTO
+      org.quartz.jobStore.driverDelegateClass: org.quartz.impl.jdbcjobstore.PostgreSQLDelegate
+      org.quartz.jobStore.tablePrefix: QRTZ_
+      org.quartz.jobStore.isClustered: true
+      org.quartz.jobStore.clusterCheckinInterval: 15000
+      org.quartz.jobStore.useProperties: true
+      org.quartz.threadPool.class: org.quartz.simpl.SimpleThreadPool
+      org.quartz.threadPool.threadCount: 5
+      org.quartz.threadPool.threadPriority: 5
+
+  # ── Kafka (disabled for mock — enable when broker is available) ──
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+# ── PDF Report Output ────────────────────────────────────────────────
+report:
+  output-dir: /tmp/reports
+
+# ── Logging ──────────────────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    com.taskscheduler: DEBUG
+    org.quartz: INFO
+    org.hibernate.SQL: WARN
