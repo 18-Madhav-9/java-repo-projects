@@ -1,52 +1,53 @@
 package com.ratelimiter.store;
 
-import com.ratelimiter.model.ClientRequestInfo;
-import org.springframework.stereotype.Component;
-
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 
 /**
- * Thread-safe, in-memory storage for per-IP rate limit state.
+ * Thread-safe, in-memory {@link CounterStore} implementation backed
+ * by a {@link ConcurrentHashMap}.
  *
- * <p>Backed by a {@link ConcurrentHashMap}; all mutations happen through
- * {@code compute()}, which guarantees atomicity per key without external locks.</p>
- *
- * <p>State is intentionally ephemeral — a restart resets all counters,
- * which is acceptable for the V1 MVP.</p>
+ * <p>All mutations through {@code compute()} are atomic per key.
+ * State is ephemeral — a restart resets all counters.</p>
  */
-@Component
-public class InMemoryStore {
+public class InMemoryStore implements CounterStore {
 
-    private final ConcurrentHashMap<String, ClientRequestInfo> clientMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> store = new ConcurrentHashMap<>();
 
-    /**
-     * Atomically increments the request count for the given client IP
-     * within the current window, resetting the window if it has expired.
-     *
-     * @param clientIp          the client's IP address
-     * @param currentTimeMillis the current epoch time in milliseconds
-     * @param windowSizeMillis  the configured window duration in milliseconds
-     * @return the updated {@link ClientRequestInfo} (count already incremented)
-     */
-    public ClientRequestInfo incrementAndGet(String clientIp, long currentTimeMillis, long windowSizeMillis) {
-        return clientMap.compute(clientIp, (key, existing) -> {
-            if (existing == null || currentTimeMillis - existing.getWindowStartTimestamp() >= windowSizeMillis) {
-                // First request ever, or window has expired → start a new window
-                return new ClientRequestInfo(1, currentTimeMillis);
-            }
-            // Same window — bump the counter
-            existing.setRequestCount(existing.getRequestCount() + 1);
-            return existing;
-        });
+    @Override
+    public Object compute(String key, BiFunction<String, Object, Object> remappingFunction) {
+        return store.compute(key, remappingFunction);
     }
 
-    /** Visible for testing — returns current map size. */
+    @Override
+    public Object get(String key) {
+        return store.get(key);
+    }
+
+    @Override
+    public void remove(String key) {
+        store.remove(key);
+    }
+
+    @Override
+    public Set<String> keys() {
+        return store.keySet();
+    }
+
+    @Override
+    public void forEach(BiConsumer<String, Object> action) {
+        store.forEach(action);
+    }
+
+    @Override
     public int size() {
-        return clientMap.size();
+        return store.size();
     }
 
-    /** Visible for testing — clears all entries. */
+    @Override
     public void clear() {
-        clientMap.clear();
+        store.clear();
     }
 }
