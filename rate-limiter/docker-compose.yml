@@ -1,0 +1,56 @@
+services:
+  # ─────────────────────────────────────────────────────────
+  # Redis — shared rate limit state for all app instances
+  # ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rate-limiter-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────
+  # Rate Limiter App
+  # ─────────────────────────────────────────────────────────
+  rate-limiter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rate-limiter-app
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Override limits or algorithm here if needed:
+      # RATE_LIMIT_ALGORITHM: TOKEN_BUCKET
+      # RATE_LIMIT_DEFAULT_MAX_REQUESTS: 50
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────
+  # Scale demo: docker compose up --scale rate-limiter=2
+  # Both instances share the same Redis → globally consistent
+  # rate limits across the fleet.
+  # ─────────────────────────────────────────────────────────
